@@ -74,14 +74,14 @@ pub async fn relintio_middleware(
                 .header(header::LOCATION, &path)
                 .header(header::SET_COOKIE, cookie.to_string())
                 .body(axum::body::boxed(Body::empty()))
-                .unwrap();
+                .unwrap_or_else(|_| Response::new(axum::body::boxed(Body::empty())));
             return redirect_res;
         } else {
             return Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .header(header::CONTENT_TYPE, "text/plain")
                 .body(axum::body::boxed(Body::from("Invalid Token")))
-                .unwrap();
+                .unwrap_or_else(|_| Response::new(axum::body::boxed(Body::empty())));
         }
     }
 
@@ -132,7 +132,7 @@ pub async fn relintio_middleware(
                 }
                 
                 // Fetch rules to pass config values to builder
-                let rules_guard = agent.rules.blocking_read();
+                let rules_guard = agent.rules.read().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let rules = rules_guard.as_ref().cloned().unwrap_or(serde_json::json!({}));
                 
                 let injector = crate::obsidian::ObsidianInjector::new();
@@ -161,21 +161,21 @@ pub async fn relintio_middleware(
                 .status(StatusCode::FOUND)
                 .header(header::LOCATION, redirect_url)
                 .body(axum::body::boxed(Body::empty()))
-                .unwrap()
+                .unwrap_or_else(|_| Response::new(axum::body::boxed(Body::empty())))
         }
         Decision::Decoy => {
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/html")
                 .body(axum::body::boxed(Body::from(RelintioAgent::decoy_html())))
-                .unwrap()
+                .unwrap_or_else(|_| Response::new(axum::body::boxed(Body::empty())))
         }
         Decision::Block => {
             Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .header(header::CONTENT_TYPE, "text/html")
                 .body(axum::body::boxed(Body::from(RelintioAgent::block_html())))
-                .unwrap()
+                .unwrap_or_else(|_| Response::new(axum::body::boxed(Body::empty())))
         }
     }
 }

@@ -6,14 +6,13 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::RwLock;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -53,7 +52,7 @@ struct TokenBucket {
 
 pub struct RelintioAgent {
     config: RelintioConfig,
-    rules: Arc<RwLock<Option<Value>>>,
+    pub(crate) rules: Arc<RwLock<Option<Value>>>,
     synced_at: Arc<Mutex<u64>>,
     buckets: Arc<Mutex<HashMap<String, TokenBucket>>>,
     client: reqwest::Client,
@@ -73,7 +72,11 @@ impl RelintioAgent {
             rules: Arc::new(RwLock::new(None)),
             synced_at: Arc::new(Mutex::new(0)),
             buckets: Arc::new(Mutex::new(HashMap::new())),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             cache_path: cache_dir,
         };
 
@@ -107,12 +110,12 @@ impl RelintioAgent {
             Err(_) => return false,
         };
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs(),
+            Err(_) => return false,
+        };
 
-        if now.saturating_sub(ts) > 120 {
+        if now.abs_diff(ts) > 120 {
             return false;
         }
 
@@ -151,7 +154,7 @@ impl RelintioAgent {
         if self.cache_path.exists() {
             let data = fs::read_to_string(&self.cache_path)?;
             let parsed: Value = serde_json::from_str(&data)?;
-            let mut w = self.rules.blocking_write();
+            let mut w = self.rules.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             *w = Some(parsed);
         }
         Ok(())
@@ -165,37 +168,40 @@ impl RelintioAgent {
 
     /// Triggers rules fetch from the API and saves it. Async-safe.
     pub async fn refresh_rules(&self, domain: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let url = format!("{}/rules", self.config.api_url);
-        let res = self.client.get(&url)
-            .header("X-License-Key", &self.config.license_key)
-            .header("X-Domain", domain)
-            .header("X-Agent-Version", AGENT_VERSION)
-            .header("X-Agent-Kind", "rust")
-            .timeout(Duration::from_secs(5))
+        let url = format!("{}/agent/verify", self.config.api_url.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "license_key": self.config.license_key,
+            "domain": domain,
+            "protocol_version": 1,
+            "agent_kind": "rust",
+            "agent_version": AGENT_VERSION,
+            "capabilities": ["custom_rules", "telemetry"]
+        });
+        let res = self.client.post(&url)
+            .json(&body)
             .send()
-            .await?;
+            .await?
+            .error_for_status()?;
 
-        if res.status().is_success() {
-            let val: Value = res.json().await?;
-            {
-                let mut w = self.rules.write().await;
-                *w = Some(val.clone());
-            }
-            let mut sync = self.synced_at.lock().unwrap();
-            *sync = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            let _ = self.save_cache_to_disk(&val);
+        let val: Value = res.json().await?;
+        {
+            let mut w = self.rules.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *w = Some(val.clone());
         }
+        let mut sync = self.synced_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *sync = unix_now();
+        let _ = self.save_cache_to_disk(&val);
         Ok(())
     }
 
     /// Heartbeat signal trigger.
     pub async fn send_heartbeat(&self, domain: &str) {
-        let url = format!("{}/agent/heartbeat", self.config.api_url);
+        let url = format!("{}/agent/heartbeat", self.config.api_url.trim_end_matches('/'));
         let body = serde_json::json!({
             "license_key": self.config.license_key,
             "domain": domain,
             "agent_version": AGENT_VERSION,
-            "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+            "timestamp": unix_now()
         });
 
         let _ = self.client.post(&url)
@@ -203,6 +209,38 @@ impl RelintioAgent {
             .timeout(Duration::from_secs(2))
             .send()
             .await;
+    }
+
+    async fn challenge_url(&self, domain: &str, path: &str) -> Option<String> {
+        use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+
+        let endpoint = format!("{}/agent/challenge/init", self.config.api_url.trim_end_matches('/'));
+        let scheme = if domain == "localhost" || domain.starts_with("localhost:") || domain == "127.0.0.1" || domain.starts_with("127.0.0.1:") {
+            "http"
+        } else {
+            "https"
+        };
+        let return_url = format!("{}://{}{}", scheme, domain, path);
+        let response = self.client.post(endpoint)
+            .json(&serde_json::json!({
+                "license_key": self.config.license_key,
+                "return_url": return_url,
+            }))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?;
+        let body: Value = response.json().await.ok()?;
+        let token = body.get("token")?.as_str()?;
+        let platform_url = self.config.api_url.trim_end_matches('/').strip_suffix("/api")
+            .unwrap_or(self.config.api_url.trim_end_matches('/'));
+
+        Some(format!(
+            "{}/security-check?token={}",
+            platform_url,
+            utf8_percent_encode(token, NON_ALPHANUMERIC),
+        ))
     }
 
     /// Evaluates the request against protection rules.
@@ -214,7 +252,7 @@ impl RelintioAgent {
         method: &str,
         path: &str,
     ) -> u32 {
-        let mut score = 0;
+        let mut score: u32 = 0;
 
         // UA evaluation
         let ua = user_agent.unwrap_or("");
@@ -247,14 +285,34 @@ impl RelintioAgent {
             score += 35;
         }
 
-        score
+        let rules = self.rules.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(custom_rules) = rules.as_ref().and_then(|value| value.get("rules")).and_then(Value::as_array) {
+            for rule in custom_rules {
+                let rule_type = rule.get("type").and_then(Value::as_str).unwrap_or("");
+                let pattern = rule.get("pattern").and_then(Value::as_str).unwrap_or("");
+                let condition = rule.get("condition").and_then(Value::as_str).unwrap_or("contains");
+                let candidate = match rule_type {
+                    "ip" => ip,
+                    "user_agent" => ua,
+                    "path" => path,
+                    _ => continue,
+                };
+                let matched = if condition == "equals" {
+                    candidate.eq_ignore_ascii_case(pattern)
+                } else {
+                    candidate.to_lowercase().contains(&pattern.to_lowercase())
+                };
+                if matched {
+                    score = score.saturating_add(rule.get("score").and_then(Value::as_u64).unwrap_or(0) as u32);
+                }
+            }
+        }
+
+        score.min(100)
     }
 
     fn consume_token(&self, ip: &str, path: &str) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
+        let now = unix_now() as f64;
 
         let mut multiplier = 1.0;
         let route_multipliers = [
@@ -274,7 +332,7 @@ impl RelintioAgent {
         let burst = 24.0 * multiplier;
         let rate_per_sec = 8.0 * multiplier;
 
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = self.buckets.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let bucket = buckets.entry(ip.to_string()).or_insert_with(|| TokenBucket {
             tokens: burst,
             last_ts: now,
@@ -303,10 +361,10 @@ impl RelintioAgent {
         domain: &str,
     ) -> Decision {
         // Sync rules if empty or expired
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = unix_now();
         let should_sync = {
-            let last = self.synced_at.lock().unwrap();
-            *last == 0 || (now - *last) > self.config.sync_interval_seconds
+            let last = self.synced_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *last == 0 || now.saturating_sub(*last) > self.config.sync_interval_seconds
         };
 
         if should_sync {
@@ -315,24 +373,23 @@ impl RelintioAgent {
 
         let score = self.score_request(ip, user_agent, headers, method, path);
 
-        let mut final_decision = Decision::Allow;
-        for (tier, threshold) in THRESHOLDS.iter() {
-            if score >= *threshold {
-                final_decision = match *tier {
-                    "ALLOW" => Decision::Allow,
-                    "SLOW" => Decision::Slow,
-                    "CHALLENGE" => {
-                        let redirect = format!("{}/security-check?token={}", self.config.api_url, self.passport_value());
-                        Decision::Challenge { redirect_url: redirect }
-                    }
-                    "DECOY" => Decision::Decoy,
-                    "BLOCK" => Decision::Block,
-                    _ => Decision::Allow,
-                }
-            }
+        if score >= threshold("BLOCK") {
+            return Decision::Block;
+        }
+        if score >= threshold("DECOY") {
+            return Decision::Decoy;
+        }
+        if score >= threshold("CHALLENGE") {
+            return match self.challenge_url(domain, path).await {
+                Some(redirect_url) => Decision::Challenge { redirect_url },
+                None => Decision::Allow,
+            };
+        }
+        if score >= threshold("SLOW") {
+            return Decision::Slow;
         }
 
-        final_decision
+        Decision::Allow
     }
 
     pub fn decoy_html() -> &'static str {
@@ -342,4 +399,17 @@ impl RelintioAgent {
     pub fn block_html() -> &'static str {
         BLOCK_HTML
     }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn threshold(tier: &str) -> u32 {
+    THRESHOLDS.iter()
+        .find_map(|(name, value)| (*name == tier).then_some(*value))
+        .unwrap_or(0)
 }

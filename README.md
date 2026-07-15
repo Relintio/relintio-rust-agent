@@ -43,7 +43,7 @@ use relintio_agent::{RelintioAgent, RelintioConfig, middleware::axum::relintio_m
 async fn main() {
     let config = RelintioConfig {
         license_key: "YOUR_LICENSE_KEY".to_string(),
-        api_url: "https://api.relintio.com/api".to_string(),
+        api_url: "https://relintio.com/api".to_string(),
         sync_interval_seconds: 60,
     };
 
@@ -76,7 +76,7 @@ async fn hello() -> impl Responder {
 async fn main() -> std::io::Result<()> {
     let config = RelintioConfig {
         license_key: "YOUR_LICENSE_KEY".to_string(),
-        api_url: "https://api.relintio.com/api".to_string(),
+        api_url: "https://relintio.com/api".to_string(),
         sync_interval_seconds: 60,
     };
 
