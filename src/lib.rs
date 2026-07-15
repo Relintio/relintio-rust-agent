@@ -16,7 +16,7 @@ use serde_json::Value;
 
 type HmacSha256 = Hmac<Sha256>;
 
-const AGENT_VERSION: &str = "0.1.0";
+const AGENT_VERSION: &str = "0.1.1";
 const THRESHOLDS: &[(&str, u32)] = &[
     ("ALLOW", 0),
     ("SLOW", 40),
