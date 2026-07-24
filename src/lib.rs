@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +55,9 @@ pub struct RelintioAgent {
     config: RelintioConfig,
     pub(crate) rules: Arc<RwLock<Option<Value>>>,
     synced_at: Arc<Mutex<u64>>,
+    next_sync_at: Arc<Mutex<u64>>,
+    sync_failures: Arc<Mutex<u8>>,
+    sync_in_progress: AtomicBool,
     buckets: Arc<Mutex<HashMap<String, TokenBucket>>>,
     client: reqwest::Client,
     cache_path: PathBuf,
@@ -71,6 +75,9 @@ impl RelintioAgent {
             config,
             rules: Arc::new(RwLock::new(None)),
             synced_at: Arc::new(Mutex::new(0)),
+            next_sync_at: Arc::new(Mutex::new(0)),
+            sync_failures: Arc::new(Mutex::new(0)),
+            sync_in_progress: AtomicBool::new(false),
             buckets: Arc::new(Mutex::new(HashMap::new())),
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
@@ -201,6 +208,7 @@ impl RelintioAgent {
             "license_key": self.config.license_key,
             "domain": domain,
             "agent_version": AGENT_VERSION,
+            "agent_kind": "rust",
             "timestamp": unix_now()
         });
 
@@ -233,12 +241,25 @@ impl RelintioAgent {
             .ok()?;
         let body: Value = response.json().await.ok()?;
         let token = body.get("token")?.as_str()?;
-        let platform_url = self.config.api_url.trim_end_matches('/').strip_suffix("/api")
-            .unwrap_or(self.config.api_url.trim_end_matches('/'));
+        if let Some(challenge_url) = body.get("challenge_url").and_then(Value::as_str) {
+            if challenge_url.starts_with("https://") || challenge_url.starts_with("http://") {
+                return Some(challenge_url.to_string());
+            }
+        }
+
+        let mut platform_url = reqwest::Url::parse(self.config.api_url.trim_end_matches('/')).ok()?;
+        if let Some(host) = platform_url.host_str().map(str::to_string) {
+            if let Some(root_host) = host.strip_prefix("api.") {
+                platform_url.set_host(Some(root_host)).ok()?;
+            }
+        }
+        platform_url.set_path("");
+        platform_url.set_query(None);
+        platform_url.set_fragment(None);
 
         Some(format!(
             "{}/security-check?token={}",
-            platform_url,
+            platform_url.as_str().trim_end_matches('/'),
             utf8_percent_encode(token, NON_ALPHANUMERIC),
         ))
     }
@@ -362,13 +383,12 @@ impl RelintioAgent {
     ) -> Decision {
         // Sync rules if empty or expired
         let now = unix_now();
-        let should_sync = {
-            let last = self.synced_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            *last == 0 || now.saturating_sub(*last) > self.config.sync_interval_seconds
-        };
+        let should_sync = now >= *self.next_sync_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if should_sync {
-            let _ = self.refresh_rules(domain).await;
+        if should_sync && self.sync_in_progress.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            let success = self.refresh_rules(domain).await.is_ok();
+            self.schedule_next_sync(success);
+            self.sync_in_progress.store(false, Ordering::Release);
         }
 
         let score = self.score_request(ip, user_agent, headers, method, path);
@@ -390,6 +410,22 @@ impl RelintioAgent {
         }
 
         Decision::Allow
+    }
+
+    fn schedule_next_sync(&self, success: bool) {
+        let mut failures = self.sync_failures.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *failures = if success { 0 } else { failures.saturating_add(1).min(5) };
+        let base = if success {
+            self.config.sync_interval_seconds.max(10)
+        } else {
+            self.config.sync_interval_seconds.max(10).saturating_mul(1_u64 << *failures).min(300)
+        };
+        let jitter = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| 80 + (u64::from(duration.subsec_nanos()) % 41))
+            .unwrap_or(100);
+        let delay = (base.saturating_mul(jitter) / 100).max(8);
+        *self.next_sync_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = unix_now().saturating_add(delay);
     }
 
     pub fn decoy_html() -> &'static str {

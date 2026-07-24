@@ -11,7 +11,7 @@ async fn main() {
     let config = RelintioConfig {
         license_key: "{{LICENSE_KEY}}".to_string(),
         api_url: "{{API_URL}}".to_string(),
-        sync_interval_seconds: 60,
+        sync_interval_seconds: 10,
     };
 
     let agent = Arc::new(RelintioAgent::new(config));

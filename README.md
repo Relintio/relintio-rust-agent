@@ -43,8 +43,8 @@ use relintio_agent::{RelintioAgent, RelintioConfig, middleware::axum::relintio_m
 async fn main() {
     let config = RelintioConfig {
         license_key: "YOUR_LICENSE_KEY".to_string(),
-        api_url: "https://relintio.com/api".to_string(),
-        sync_interval_seconds: 60,
+        api_url: "https://api.relintio.com/v1".to_string(),
+        sync_interval_seconds: 10,
     };
 
     let agent = Arc::new(RelintioAgent::new(config));
@@ -76,8 +76,8 @@ async fn hello() -> impl Responder {
 async fn main() -> std::io::Result<()> {
     let config = RelintioConfig {
         license_key: "YOUR_LICENSE_KEY".to_string(),
-        api_url: "https://relintio.com/api".to_string(),
-        sync_interval_seconds: 60,
+        api_url: "https://api.relintio.com/v1".to_string(),
+        sync_interval_seconds: 10,
     };
 
     let agent = Arc::new(RelintioAgent::new(config));
@@ -106,3 +106,12 @@ async fn main() -> std::io::Result<()> {
 ## License
 
 This project is licensed under the MIT License.
+
+## Dashboard Deployment Workflow
+
+1. Open **Dashboard → Deployment**, select **Rust**, and download the prepared Axum starter.
+2. Merge the dependency and middleware registration into the application before protected routes.
+3. Restart the service, then open one public HTTP route.
+4. Enter that exact URL or public IP endpoint in Relintio and select **Verify target**.
+
+The SDK reports runtime kind `rust` and its version during rule synchronization. Policy revisions are received by the running agent automatically.
