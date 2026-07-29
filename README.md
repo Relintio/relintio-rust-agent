@@ -1,5 +1,8 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/Relintio/relintio-rust-agent/main/assets/relintio-logo.svg" alt="Relintio" width="260">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/relintio-logo-dark.svg">
+    <img src="./assets/relintio-logo-light.svg" alt="Relintio" width="260">
+  </picture>
 
   <h1>relintio-agent</h1>
 
