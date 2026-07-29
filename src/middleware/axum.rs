@@ -18,7 +18,19 @@ pub async fn relintio_middleware(
     req: Request<Body>,
     next: Next<Body>,
 ) -> Response {
-    let domain = req.uri().host().unwrap_or("localhost").to_string();
+    // The authority lives in the Host header, not the URI: an
+    // origin-form HTTP/1.1 request line carries only the path, so
+    // `uri().host()` is None for essentially all real traffic. Reading
+    // it meant every site reported itself as `localhost` — which is the
+    // domain the control plane matched rules against, and the domain a
+    // challenged visitor was redirected back to.
+    let domain = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| req.uri().host())
+        .unwrap_or("localhost")
+        .to_string();
     let path = req.uri().path().to_string();
     let method = req.method().as_str().to_string();
 
@@ -46,6 +58,11 @@ pub async fn relintio_middleware(
 
     let user_agent = headers.get("user-agent").map(|s| s.as_str());
 
+    // Raw header values, used verbatim for the passport binding — normalising
+    // them here would diverge from the challenge server.
+    let ua_header = headers.get("user-agent").cloned().unwrap_or_default();
+    let lang_header = headers.get("accept-language").cloned().unwrap_or_default();
+
     // 3. Handle up_token verification/exchange (challenge success)
     let query = req.uri().query().unwrap_or("");
     let mut params = HashMap::new();
@@ -60,11 +77,12 @@ pub async fn relintio_middleware(
         let decoded_token = percent_encoding::percent_decode_str(up_token)
             .decode_utf8_lossy()
             .to_string();
-        if agent.verify_up_token(&decoded_token) {
-            let cookie_val = agent.passport_value();
+        if let Some(payload) = agent.verify_passport(&decoded_token, &ua_header, &lang_header) {
+            let ttl = crate::passport::clamp_ttl(payload.ttl.unwrap_or(0));
+            let cookie_val = agent.mint_passport(ttl, &ua_header, &lang_header);
             let cookie = Cookie::build(("relintio_passport", cookie_val))
                 .path("/")
-                .max_age(cookie::time::Duration::days(7))
+                .max_age(cookie::time::Duration::seconds(ttl))
                 .http_only(true)
                 .build();
 
@@ -91,8 +109,8 @@ pub async fn relintio_middleware(
         if let Ok(cookie_str) = cookie_header.to_str() {
             for cookie_item in Cookie::split_parse(cookie_str) {
                 if let Ok(c) = cookie_item {
-                    if (c.name() == "relintio_passport" || c.name() == "up_passport")
-                        && c.value() == agent.passport_value()
+                    if c.name() == "relintio_passport"
+                        && agent.verify_passport(c.value(), &ua_header, &lang_header).is_some()
                     {
                         is_human = true;
                         break;
